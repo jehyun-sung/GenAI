@@ -1,6 +1,6 @@
 # GenAI
 
-🧠 Aspect-Based Sentiment Analysis with FLAN-T5
+🧠 Aspect-Based Sentiment Analysis with FLAN-T5, LLM, GPT
 
 Developed for AT Kearney AI Use Case — Big Data Structuring & Sentiment Analysis
 This repository provides an end-to-end pipeline for aspect-based sentiment analysis (ABSA). It was developed for an internal AI project at AT Kearney, focused on structuring and analyzing large-scale conversation data extracted from product and brand-related sources.
