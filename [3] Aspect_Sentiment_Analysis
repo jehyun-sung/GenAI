@@ -1,0 +1,285 @@
+# ────────────────────────────── Imports ──────────────────────────────
+import os, re, ast, json, yaml, functools
+import torch
+import numpy as np
+import pandas as pd
+from typing import Any, List, Tuple, Dict, Optional, Union
+from pathlib import Path
+from urllib.parse import urlparse
+from itertools import zip_longest
+from datasets import Dataset, DatasetDict
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    pipeline as hf_pipeline
+)
+
+from InstructABSA.utils import T5Classifier
+from InstructABSA.config import Config
+from instructions import InstructionsHandler
+
+# ────────────────────────────── Configuration ──────────────────────────────
+INPUT_PATH_1  = "/content/Aspect_Extraction_implicit.xlsx"
+INPUT_PATH_2  = "/content/Aspect_Extraction_explicit.xlsx"
+OUTPUT_PATH   = "/content/Aspect_Sentiment_Analysis_Result.xlsx"
+
+CHECKPOINT = "<your_checkpoint_path>/googleflan-t5-large-SA_E2E_250617_ver1_best"
+
+MODE = "prod"
+BATCH_SIZE = 8
+MAX_INPUT_LEN = 128
+MAX_NEW_TOK = 3
+
+
+# ────────────────────────────── Utilities ──────────────────────────────
+def _ensure_list(val: Any) -> List[str]:
+    """Ensure the value is parsed as a list of strings."""
+    if isinstance(val, list):
+        return val if val else ["Unknown"]
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return []
+    if isinstance(val, str):
+        t = val.strip()
+        if t.startswith("[") and t.endswith("]"):
+            try:
+                parsed = ast.literal_eval(t)
+                return parsed if isinstance(parsed, list) else [str(parsed)]
+            except Exception:
+                return [t]
+        return [t]
+    return [str(val)]
+
+def _flatten_col(series) -> List[str]:
+    """Flatten a column of list-like strings into a single list."""
+    flat: List[str] = []
+    for cell in series:
+        flat.extend(_ensure_list(cell))
+    return flat
+
+
+# ────────────────────────────── SentimentAnalyzer Class ──────────────────────────────
+class SentimentAnalyzer:
+    def __init__(self, checkpoint_path: str, model_name: str = "google/flan-t5-large"):
+        """Initialize sentiment analyzer using a FLAN-T5 model checkpoint."""
+        self.instruct_handler = InstructionsHandler()
+        self.instruct_handler.load_instruction_set1()
+
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            print(f"Loading model from checkpoint: <hidden_checkpoint_path>")
+            self.t5_exp = T5Classifier(model_checkpoint=checkpoint_path)
+        else:
+            print(f"Loading base model: {model_name}")
+            self.t5_exp = T5Classifier(model_checkpoint=model_name)
+
+    def analyze_sentiment(self, texts: List[str], brands: List[str], aspects: List[str]) -> List[Tuple[str, float]]:
+        """Run batch sentiment analysis on sentences using the T5 model."""
+        instructions = [
+            f"In the sentence: '{text}', is the sentiment toward '{aspect if aspect != 'general' else brand}' positive, negative, or neutral?"
+            for text, brand, aspect in zip(texts, brands, aspects)
+        ]
+
+        df = pd.DataFrame({
+            "raw_text": texts,
+            "aspect": [aspect if aspect else brand for aspect, brand in zip(aspects, brands)],
+            "instruction": instructions
+        })
+
+        hf_dataset = Dataset.from_pandas(df)
+        tokenized_dataset = hf_dataset.map(
+            lambda x: self.t5_exp.tokenizer(
+                x["instruction"],
+                padding="max_length",
+                truncation=True,
+                max_length=512
+            ),
+            remove_columns=list(df.columns),
+        )
+        id_tokenized_ds = DatasetDict({"test": tokenized_dataset})
+
+        predicted_labels, confidences = self.t5_exp.get_labels(
+            tokenized_dataset=id_tokenized_ds,
+            sample_set='test',
+            batch_size=len(texts)
+        )
+
+        return list(zip(predicted_labels, confidences))
+
+
+# ────────────────────────────── SentimentAnalysisPipeline Class ──────────────────────────────
+class SentimentAnalysisPipeline:
+    def __init__(self, model_checkpoint_path: str = None):
+        """Pipeline for processing sentence-level sentiment with brand/aspect context."""
+        self.sentiment_analyzer = SentimentAnalyzer(checkpoint_path=model_checkpoint_path)
+
+    def process_conversation(
+        self,
+        conversation: Union[str, List[str]],
+        brands: Optional[List[str]] = None,
+        aspects: Optional[List[str]] = None,
+    ) -> List[Dict]:
+        """Analyze sentiment for each sentence in a conversation."""
+        sentences = conversation
+        valid_idx     = [i for i, b in enumerate(brands) if b != "Unknown"]
+        valid_sents   = [sentences[i] for i in valid_idx]
+        valid_brands  = [brands[i] for i in valid_idx]
+        valid_aspects = [aspects[i] for i in valid_idx]
+
+        sent_conf_pairs = []
+        if valid_sents:
+            sent_conf_pairs = self.sentiment_analyzer.analyze_sentiment(valid_sents, valid_brands, valid_aspects)
+
+        results, s_i = [], 0
+        for s, br, asp in zip(sentences, brands, aspects):
+            if br == "Unknown":
+                results.append({
+                    "conversation": s,
+                    "company": "Unknown",
+                    "aspect": "",
+                    "sentiment": "N/A",
+                    "confidence": ""
+                })
+            else:
+                sentiment, conf = sent_conf_pairs[s_i]
+                s_i += 1
+                results.append({
+                    "conversation": s,
+                    "company": br,
+                    "aspect": asp,
+                    "sentiment": sentiment,
+                    "confidence": conf
+                })
+        return results
+
+
+# ────────────────────────────── Load Model ──────────────────────────────
+print("🔹 Loading FLAN-T5 model …")
+tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)
+model = AutoModelForSeq2SeqLM.from_pretrained(
+    CHECKPOINT,
+    device_map="auto",
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True,
+)
+device = model.device
+model.eval()
+print("   ↳ Model loaded\n")
+
+
+# ────────────────────────────── Load Excel Files ──────────────────────────────
+print("🔹 Reading Excel files …")
+df_imp = pd.read_excel(INPUT_PATH_1)
+df_exp = pd.read_excel(INPUT_PATH_2)
+
+if MODE == "dev":
+    keep = ["Media Title", "Conversation Stream", "True_Aspect", "True_Sentiment", "Predicted_Aspect", "Predicted_Brand", "Implicit"]
+    df = pd.concat([df_exp[keep], df_imp], ignore_index=True)
+else:
+    df = pd.concat([df_exp, df_imp], ignore_index=True)
+
+for col in ("Predicted_Brand", "Predicted_Aspect"):
+    df[col] = df[col].apply(_ensure_list)
+
+sentences = df["Conversation Stream"].astype(str).tolist()
+brands    = _flatten_col(df["Predicted_Brand"])
+aspects   = _flatten_col(df["Predicted_Aspect"])
+urls      = df["url"].astype(str).fillna("").tolist()
+media_titles = df["Media Title"].astype(str).fillna("").tolist()
+
+
+# ────────────────────────────── Inference Function ──────────────────────────────
+def batch_infer(texts: List[str], bs: List[str], asp: List[str], batch_size: int = BATCH_SIZE) -> Tuple[List[str], List[float]]:
+    labels, confs = [], []
+    for i in range(0, len(texts), batch_size):
+        t_batch = texts[i:i+batch_size]
+        b_batch = bs[i:i+batch_size]
+        a_batch = asp[i:i+batch_size]
+
+        prompts = [
+            f"In the sentence: '{t}', is the sentiment toward '{a if a != 'general' else b}' positive, negative, or neutral?"
+            for t, b, a in zip(t_batch, b_batch, a_batch)
+        ]
+
+        enc = tokenizer(prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=MAX_INPUT_LEN).to(device)
+        with torch.no_grad():
+            outs = model.generate(**enc, max_new_tokens=MAX_NEW_TOK, do_sample=False)
+
+        dec = tokenizer.batch_decode(outs, skip_special_tokens=True)
+        labels.extend([d.strip().lower() for d in dec])
+        confs.extend([1.0] * len(dec))  # placeholder confidence
+
+        torch.cuda.empty_cache()
+    return labels, confs
+
+
+# ────────────────────────────── Run Inference ──────────────────────────────
+print("🔹 Running sentiment inference …")
+pred_labels, pred_confs = batch_infer(sentences, brands, aspects)
+print("   ↳ Sentiment prediction done\n")
+
+cleaned_aspects = [a.replace("about ", "").strip() for a in aspects]
+
+df_out = pd.DataFrame({
+    "Media Title": media_titles,
+    "Conversation": sentences,
+    "Predicted_Aspect": cleaned_aspects,
+    "Predicted_Sentiment": pred_labels,
+    "Confidence": pred_confs,
+    "URL": urls
+})
+
+if MODE == "dev":
+    df_out["True_Aspect"]    = _flatten_col(df["True_Aspect"])
+    df_out["True_Sentiment"] = _flatten_col(df["True_Sentiment"])
+    df_out["Implicit"]       = df["Implicit"].tolist()
+
+df_out.to_excel(OUTPUT_PATH, index=False, engine="openpyxl")
+print(f"✅ Results saved to: {OUTPUT_PATH}")
+
+
+# ────────────────────────────── Optional: Re-run with Logging ──────────────────────────────
+def main() -> None:
+    df_1 = pd.read_excel(INPUT_PATH_2)
+    df_2 = pd.read_excel(INPUT_PATH_1)
+
+    if MODE == "dev":
+        df = pd.concat([df_1[["Media Title", "Conversation Stream", "True_Aspect", "True_Sentiment", "Predicted_Aspect", "Predicted_Brand", "Implicit"]], df_2], axis=0)
+    else:
+        df = pd.concat([df_1, df_2], axis=0)
+
+    for col in ("Predicted_Brand", "Predicted_Aspect"):
+        df[col] = df[col].apply(_ensure_list)
+
+    all_results = []
+    sa_pipeline = SentimentAnalysisPipeline(CHECKPOINT)
+
+    for media_title, group in df.groupby("Media Title"):
+        sentences     = group["Conversation Stream"].astype(str).tolist()
+        group_brands  = _flatten_col(group["Predicted_Brand"])
+        group_aspects = _flatten_col(group["Predicted_Aspect"])
+
+        preds = sa_pipeline.process_conversation(sentences, brands=group_brands, aspects=group_aspects)
+
+        for orig, pred in zip(group.itertuples(index=False), preds):
+            orig_dict = orig._asdict()
+
+            result = dict(
+                Media_Title=media_title,
+                Conversation=pred["conversation"],
+                Predicted_Aspect=pred["aspect"],
+                Predicted_Sentiment=pred["sentiment"],
+                Confidence=pred["confidence"]
+            )
+
+            if MODE == "dev":
+                result["True_Aspect"] = orig_dict.get("True_Aspect", "")
+                result["True_Sentiment"] = orig_dict.get("True_Sentiment", "")
+                result["Implicit"] = orig_dict.get("Implicit", "")
+
+            all_results.append(result)
+
+    pd.DataFrame(all_results).to_excel(OUTPUT_PATH, index=False)
+    print(f"[✓] Saved: {OUTPUT_PATH}")
+    return all_results
+
+if __name__ == "__main__":
+    main()
