@@ -19,9 +19,9 @@ from InstructABSA.config import Config
 from instructions import InstructionsHandler
 
 # ────────────────────────────── Configuration ──────────────────────────────
-INPUT_PATH_1  = "/content/Aspect_Extraction_implicit.xlsx"
-INPUT_PATH_2  = "/content/Aspect_Extraction_explicit.xlsx"
-OUTPUT_PATH   = "/content/Aspect_Sentiment_Analysis_Result.xlsx"
+INPUT_PATH_1  = "//implicit.xlsx"
+INPUT_PATH_2  = "//explicit.xlsx"
+OUTPUT_PATH   = "//sentiment_Analysis_Result.xlsx"
 
 CHECKPOINT = "<your_checkpoint_path>/googleflan-t5-large-SA_E2E_250617_ver1_best"
 
