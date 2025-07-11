@@ -71,7 +71,7 @@ Implicit (dev)	Flag for human post-labeling
 MODE = "dev" or "prod"
 
 # Run all cells from top to bottom
-# Result file will be saved to: /content/Aspect_Sentiment_Analysis_Result.xlsx
+
 📌 Notes
 
 The pipeline assumes that brand/aspect prediction is precomputed and available in Excel files.
